@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import logging
+import time
+from datetime import datetime, timezone
 from src.client import initialize_client
 from src.blockchain import BlockchainManager
 from src.discovery import DiscoveryManager
@@ -15,58 +17,100 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+async def run_market_cycle(market_data: dict, client, blockchain, dry_run: bool, redis_logger: RedisLogger):
+    """
+    Manages the lifecycle of a single 5-minute market:
+    1. Subscribes to updates.
+    2. Runs arbitrage until 30s before expiry.
+    3. Liquidates remaining positions.
+    """
+    expiry = market_data.get('end_timestamp')
+    if not expiry:
+        logger.error(f"Market {market_data['market_id']} missing end_timestamp. Skipping.")
+        return
+
+    logger.info(f"--- STARTING CYCLE: Market {market_data['market_id'][-6:]} (Expires: {datetime.fromtimestamp(expiry).strftime('%H:%M:%S')}) ---")
+    
+    # 1. Initialize Streamer and Strategy for this market
+    token_pairs = [market_data]
+    strategy = ArbitrageStrategy(client, token_pairs, blockchain, dry_run=dry_run, redis_logger=redis_logger)
+    streamer = WebSocketStreamer(client, token_pairs)
+
+    # 2. Start WebSocket stream in a background task
+    stream_task = asyncio.create_task(streamer.connect_and_stream(strategy.on_price_update))
+    logger_task = asyncio.create_task(redis_logger.run_subscriber())
+
+    try:
+        # 3. Wait until 30 seconds before expiry
+        while True:
+            now = time.time()
+            time_left = expiry - now
+            
+            if time_left <= 30:
+                logger.info(f"Market expiry approaching ({int(time_left)}s left). Starting liquidation phase...")
+                break
+            
+            if time_left > 60:
+                await asyncio.sleep(10)
+            else:
+                await asyncio.sleep(1)
+
+        # 4. Trigger Liquidation Exit
+        await strategy.active_exit(market_data, streamer.best_prices)
+        
+    finally:
+        # Cleanup tasks for this cycle
+        stream_task.cancel()
+        logger_task.cancel()
+        try:
+            await asyncio.gather(stream_task, logger_task, return_exceptions=True)
+        except:
+            pass
+    
+    logger.info(f"--- CYCLE COMPLETE: Market {market_data['market_id'][-6:]} ---")
+
 async def main(dry_run: bool):
-    logger.info("Starting Polymarket Arbitrage Bot...")
+    logger.info("Starting Polymarket Autonomous Arbitrage Bot...")
     if dry_run:
         logger.info("--- RUNNING IN PAPER TRADING (DRY-RUN) MODE ---")
 
-    # 1. Initialize API Client
-    try:
-        client = initialize_client()
-    except ValueError as e:
-        logger.error(f"Initialization Error: {e}")
-        return
-
-    # 2. Blockchain Setup (Approvals)
+    client = initialize_client()
     blockchain = BlockchainManager()
-    logger.info("Ensuring on-chain CTF token allowances are set...")
-    # NOTE: Set to skip automatic sending on mainnet without explicit user approval
-    try:
-        if not dry_run:
-            blockchain.setup_all_approvals()
-        else:
-            logger.info("Approvals skipped for dry-run/dev.")
-    except Exception as e:
-        logger.error(f"Blockchain setup failed: {e}")
-        return
-
-    # 3. Discover Markets via Gamma API
     discovery = DiscoveryManager()
-    markets = discovery.get_upcoming_btc_5m_markets()
-    if not markets:
-        logger.info("No active specific markets found matching criteria. Exiting.")
-        return
-        
-    logger.info(f"Discovered {len(markets)} active target markets.")
-    token_pairs = discovery.extract_token_pairs(markets)
-    logger.info(f"Subscribing to {len(token_pairs) * 2} specific active tokens.")
-
-    # 4. Initialize Strategy Engine with Redis Logger
     redis_logger = RedisLogger()
-    strategy = ArbitrageStrategy(client, token_pairs, blockchain, dry_run=dry_run, redis_logger=redis_logger)
 
-    # 5. Connect WebSocket and Stream
-    streamer = WebSocketStreamer(client, token_pairs)
-    
-    try:
-        # Run websocket stream, background stdout reporter, AND redis background subscriber concurrently
-        await asyncio.gather(
-            streamer.connect_and_stream(strategy.on_price_update),
-            # strategy.run_background_reporting(streamer),
-            redis_logger.run_subscriber()
-        )
-    except Exception as e:
-        logger.error(f"WebSocket Stream encountered an error: {e}")
+    if not dry_run:
+        logger.info("Ensuring on-chain CTF token allowances are set...")
+        blockchain.setup_all_approvals()
+
+    while True:
+        try:
+            # Discover target markets
+            markets = discovery.get_upcoming_btc_5m_markets()
+            if not markets:
+                logger.info("No active specific markets found. Waiting 30s...")
+                await asyncio.sleep(30)
+                continue
+            
+            token_pairs = discovery.extract_token_pairs(markets)
+            if not token_pairs:
+                await asyncio.sleep(30)
+                continue
+
+            # Target the SOONEST expiring market among discovered
+            current_market = sorted(token_pairs, key=lambda x: x['end_timestamp'])[0]
+            
+            # Run the cycle for this market
+            await run_market_cycle(current_market, client, blockchain, dry_run, redis_logger)
+            
+            # Small buffer before looking for next market
+            await asyncio.sleep(5)
+            
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            logger.error(f"Global loop error: {e}. Retrying in 10s...")
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Polymarket Arbitrage Bot")

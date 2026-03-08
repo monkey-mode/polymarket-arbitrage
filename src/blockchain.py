@@ -10,8 +10,13 @@ logger = logging.getLogger(__name__)
 # Basic ABI for ERC20 approve
 ERC20_ABI = json.loads('''[{"constant":false,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":true,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"}]''')
 
-# Basic ABI for ERC1155 setApprovalForAll
-ERC1155_ABI = json.loads('''[{"constant":false,"inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},{"constant":true,"inputs":[{"name":"account","type":"address"},{"name":"operator","type":"address"}],"name":"isApprovedForAll","outputs":[{"name":"","type":"bool"}],"payable":false,"stateMutability":"view","type":"function"}]''')
+# Basic ABI for ERC1155 setApprovalForAll and CTF mergePositions
+ERC1155_ABI = json.loads('''[
+    {"constant":false,"inputs":[{"name":"operator","type":"address"},{"name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},
+    {"constant":true,"inputs":[{"name":"account","type":"address"},{"name":"operator","type":"address"}],"name":"isApprovedForAll","outputs":[{"name":"","type":"bool"}],"payable":false,"stateMutability":"view","type":"function"},
+    {"constant":false,"inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},{"name":"conditionId","type":"bytes32"},{"name":"partition","type":"uint256[]"},{"name":"amount","type":"uint256"}],"name":"mergePositions","outputs":[],"payable":false,"stateMutability":"nonpayable","type":"function"},
+    {"constant":true,"inputs":[{"name":"account","type":"address"},{"name":"id","type":"uint256"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"}
+]''')
 
 # Basic ABI for the NegRiskAdapter
 NEG_RISK_ABI = json.loads('''[{"inputs":[{"internalType":"bytes32","name":"conditionId","type":"bytes32"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"convert","outputs":[],"stateMutability":"nonpayable","type":"function"}]''')
@@ -27,8 +32,9 @@ class BlockchainManager:
         # Inject PoA middleware for Polygon compatibility (extraData field length)
         self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
-        self.funder = Web3.to_checksum_address(config.WALLET_ADDRESS)
+        self.funder = Web3.to_checksum_address(config.FUNDER_ADDRESS)
         self.pk = config.WALLET_PRIVATE_KEY
+        self.signer_address = self.w3.eth.account.from_key(self.pk).address
 
         self.usdc_contract = self.w3.eth.contract(address=Web3.to_checksum_address(config.Contracts.USDC), abi=ERC20_ABI)
         
@@ -51,7 +57,7 @@ class BlockchainManager:
             base_fee = latest_block.get('baseFeePerGas', self.w3.to_wei('30', 'gwei'))
             # Polygon standard: 30 Gwei priority fee is usually enough, 
             # but we use 50 as a safer baseline for arbitrage
-            priority_fee = self.w3.to_wei('50', 'gwei')
+            priority_fee = self.w3.to_wei('150', 'gwei')
             max_fee = int(base_fee * 1.5) + priority_fee  # 50% buffer on base fee
         except Exception as e:
             logger.warning(f"Failed to fetch dynamic gas, falling back to 150 Gwei: {e}")
@@ -60,7 +66,8 @@ class BlockchainManager:
 
         attempt = 0
         while attempt < 3:
-            nonce = self.w3.eth.get_transaction_count(self.funder)
+            # Nonce must match the address that is SIGNING the transaction (the one paying for gas)
+            nonce = self.w3.eth.get_transaction_count(self.signer_address)
             tx = func_call.build_transaction({
                 'chainId': config.CHAIN_ID,
                 'gas': 2000000,
@@ -139,3 +146,39 @@ class BlockchainManager:
         condition_id_bytes = Web3.to_bytes(hexstr=condition_id_hex)
         logger.info(f"Converting NO tokens for condition {condition_id_hex}")
         return self.send_tx(self.neg_risk_contract.functions.convert(condition_id_bytes, amount))
+
+    def get_token_balance(self, address, token_id):
+        """
+        Returns the on-chain balance of an ERC1155 token (outcome share).
+        """
+        try:
+            # Polymarket token IDs are uint256
+            tid = int(token_id) if isinstance(token_id, str) and token_id.isdigit() else int(token_id, 16) if isinstance(token_id, str) and token_id.startswith('0x') else int(token_id)
+            return self.ctf_contract.functions.balanceOf(Web3.to_checksum_address(address), tid).call()
+        except Exception as e:
+            logger.error(f"Failed to fetch balance for {token_id}: {e}")
+            return 0
+
+    def merge_positions(self, condition_id_hex, amount):
+        """
+        Merges YES and NO tokens back into USDC.
+        `amount` is the number of pairs to merge (uint256, 6 decimals).
+        """
+        if self.signer_address != self.funder:
+            logger.warning(f"CRITICAL: Signer ({self.signer_address}) is not Funder ({self.funder}). Merge will likely fail unless funds are moved or Funder signs.")
+            
+        condition_id_bytes = Web3.to_bytes(hexstr=condition_id_hex)
+        collateral_token = Web3.to_checksum_address(config.Contracts.USDC)
+        parent_id = b'\x00' * 32 # standard binary markets have no parent
+        
+        # Partition 1 and 2 usually represent YES and NO outcomes
+        partition = [1, 2] 
+        
+        logger.info(f"Merging {amount / 10**6:.6f} pairs back to USDC for condition {condition_id_hex}")
+        return self.send_tx(self.ctf_contract.functions.mergePositions(
+            collateral_token,
+            parent_id,
+            condition_id_bytes,
+            partition,
+            amount
+        ))

@@ -56,19 +56,23 @@ class RedisLogger:
             return default_name
             
         def my_rotator(source, dest):
-            # Robust rotator with error handling
+            # Robust rotator with error handling to prevent FileNotFoundError race conditions
             try:
-                if os.path.exists(dest):
-                    os.remove(dest)
                 if os.path.exists(source):
+                    if os.path.exists(dest):
+                        os.remove(dest)
                     os.rename(source, dest)
+            except FileNotFoundError:
+                # File already moved by another handle/process or check was stale
+                pass
             except Exception as e:
                 # If OS is slow to release locks, wait a tiny bit and try again once
                 import time
                 time.sleep(0.1)
                 try:
-                    if os.path.exists(dest): os.remove(dest)
-                    if os.path.exists(source): os.rename(source, dest)
+                    if os.path.exists(source):
+                        if os.path.exists(dest): os.remove(dest)
+                        os.rename(source, dest)
                 except:
                     pass
             

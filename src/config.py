@@ -5,6 +5,9 @@ load_dotenv()
 
 WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
+FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS", WALLET_ADDRESS) # Defaults to the wallet address
+SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "0"))      # 0=EOA, 1=Proxy, 2=Alt Proxy
+
 HOST = os.getenv("HOST", "https://clob.polymarket.com")
 CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))
 WEB3_PROVIDER_URI = os.getenv("WEB3_PROVIDER_URI", "https://polygon-rpc.com")

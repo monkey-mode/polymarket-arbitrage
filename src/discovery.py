@@ -142,12 +142,24 @@ class DiscoveryManager:
                 no_key = "down" if "down" in token_map else "no"
                 
                 if yes_key in token_map and no_key in token_map:
+                    # Parse endDate (e.g., 2026-03-09T00:30:00Z) to Unix timestamp
+                    end_ts = 0
+                    end_date_str = market.get("endDate")
+                    if end_date_str:
+                        try:
+                            # Python 3.7+ supports isoformat with 'Z'
+                            dt = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+                            end_ts = int(dt.timestamp())
+                        except:
+                            pass
+
                     pairs.append({
                         "condition_id": market.get("conditionId"),
                         "market_id": market.get("id"),
                         "yes": token_map[yes_key],
                         "no": token_map[no_key],
                         "negRisk": market.get("negRisk", False),
-                        "tick_size": float(market.get("minimumTickSize", "0.01"))
+                        "tick_size": float(market.get("minimumTickSize", "0.01")),
+                        "end_timestamp": end_ts
                     })
         return pairs

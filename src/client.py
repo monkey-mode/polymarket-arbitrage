@@ -17,14 +17,14 @@ def initialize_client() -> ClobClient:
     
     # Using EOA wallet (Signature Type 0 as per the PDF)
     from web3 import Web3
-    checksummed_address = Web3.to_checksum_address(config.WALLET_ADDRESS)
+    funder_address = Web3.to_checksum_address(config.FUNDER_ADDRESS)
     
     client = ClobClient(
         host=config.HOST,
         key=config.WALLET_PRIVATE_KEY,
         chain_id=config.CHAIN_ID,
-        signature_type=0, 
-        funder=checksummed_address
+        signature_type=config.SIGNATURE_TYPE, 
+        funder=funder_address
     )
 
     client.set_api_creds(client.create_or_derive_api_creds())

@@ -23,24 +23,13 @@ class ArbitrageStrategy:
         
         self.inventory = {} # Map token_id -> position size
         self.last_log_time = 0
+        self.transaction_done = False
 
     def calculate_taker_fee(self, amount: float, price: float, token_id: str, rate_type: str = "crypto") -> float:
         """
-        Applies the 2026 Continuous Fee Formula using the live API base fee rate:
-        Fee = Amount * Rate * (1 - (2 * abs(Price - 0.5)) ** Exponent)
-        Fees < 0.0001 USDC are rounded down to 0.
+        Applies the 2026 Continuous Fee Formula using the live API base fee rate.
         """
-        # # Fetch the official base fee rate from the API (cached automatically by py-clob-client)
-        # base_fee_bps = self.client.get_fee_rate_bps(token_id)
-        
-        # # If the API explicitly returns 0, the market is subsidized and has no fee
-        # if base_fee_bps == 0:
-        #     return 0.0
-            
-        # Convert Basis Points (e.g. 150) to raw multiplier (0.0150)
-        # rate = base_fee_bps / 10000.0
         rate = 0.0
-        
         if rate_type == "crypto":
             exp = FeeConfig.CRYPTO_EXPONENT
         else:
@@ -59,37 +48,31 @@ class ArbitrageStrategy:
         no_token = market_data['no']
         
         if yes_token not in current_prices or no_token not in current_prices:
-            return # Data missing
+            return
 
         yes_ask = current_prices[yes_token]['ask']
         no_ask = current_prices[no_token]['ask']
-        yes_ask_sz = current_prices[yes_token]['ask_sz']
-        no_ask_sz = current_prices[no_token]['ask_sz']
 
         if yes_ask == 0 or no_ask == 0:
-            return # No liquidity
-
-        # Determine the maximum synthetic volume we can cross
-        # Target size set to 1.0 (1 USD payout equivalent)
-        target_amount = min(1.0, min(yes_ask_sz, no_ask_sz))
+            return
+        
+        # Fixed amount for test/safety
+        target_amount = 5.01
+        
         if target_amount < 1:
             return
 
-        # Calculate exact cost + dynamic fees
-        # Fee is extracted in outcome shares for buys, effectively increasing the cost per share.
         yes_fee = self.calculate_taker_fee(target_amount, yes_ask, yes_token)
         no_fee = self.calculate_taker_fee(target_amount, no_ask, no_token)
 
-        # Cost = Price * Amount + Fees 
         yes_cost = (yes_ask * target_amount) + yes_fee
         no_cost = (no_ask * target_amount) + no_fee
         total_cost = yes_cost + no_cost
         
-        # Payout is guaranteed 1 USDC per pair
-        expected_payout = target_amount * 1.0
-
-        # Does target < 1.00 ratio hold true?
-        if total_cost < expected_payout:
+        # expected_payout = target_amount * 1.0
+        expected_payout = 5.1
+        
+        if total_cost < expected_payout and sum(yes_ask,no_ask) < 1.0:
             profit = expected_payout - total_cost
             logger.info(f"Arbitrage Found! Target Shares: {target_amount:.2f}, Cost: ${total_cost:.4f}, Profit: ${profit:.4f}")
             
@@ -106,8 +89,15 @@ class ArbitrageStrategy:
                 await self.redis_logger.publish_log(log_data)
                 
             await self.execute_arbitrage(market_data, target_amount, yes_ask, no_ask, yes_fee, no_fee)
+            
+            # For testing: stop the program after 1 trade
+            if not self.dry_run:
+                logger.info("One-shot trade executed. Shutting down for inspection...")
+                import os
+                os._exit(0)
+            return
+
         elif print_summary and self.redis_logger:
-            # Broadcast the evaluation strictly to Redis Pub/Sub instead of stdout
             log_data = {
                 "event": "NO_ARB",
                 "market_id": market_data['market_id'][-6:],
@@ -118,66 +108,84 @@ class ArbitrageStrategy:
             }
             await self.redis_logger.publish_log(log_data)
 
+    async def active_exit(self, market_data: dict, current_prices: dict = None, forced_token: str = None, forced_qty: float = None):
+        """
+        Manually liquidates any open positions for the current market by selling them at the bid.
+        This is called 30 seconds before market expiry or during emergency atomic cleanup.
+        """
+        yes_token = market_data['yes']
+        no_token = market_data['no']
+
+        from py_clob_client.clob_types import MarketOrderArgs
+        from py_clob_client.order_builder.constants import SELL
+
+        async def sell_side(token_id, qty):
+            if qty <= 0: return
+            logger.info(f"Liquidating {qty} shares of {token_id[-8:]}...")
+            try:
+                # Use Market Orders for guaranteed exit
+                sell_args = MarketOrderArgs(amount=round(qty, 2), side=SELL, token_id=token_id)
+                resp = self.client.create_market_order(sell_args)
+                posted = self.client.post_order(resp, OrderType.GTC)
+                logger.info(f"EXIT Order Posted for {token_id[-8:]}: {posted.get('status', 'Unknown')}")
+            except Exception as e:
+                logger.error(f"Liquidation failed for {token_id[-8:]}: {e}")
+
+        # If forced_token is provided, we only sell that one (Emergency Cleanup)
+        if forced_token and forced_qty:
+            await sell_side(forced_token, forced_qty)
+            return
+
+        # Otherwise, sell regular inventory (Planned Exit)
+        yes_qty = self.inventory.get(yes_token, 0)
+        no_qty = self.inventory.get(no_token, 0)
+        
+        if yes_qty <= 0 and no_qty <= 0:
+            return
+
+        logger.info(f"Market expiry approaching! Liquidating positions for {market_data['market_id'][-6:]}")
+        logger.info(f"Targeting sale of {yes_qty:.2f} YES and {no_qty:.2f} NO shares.")
+        
+        await asyncio.gather(
+            sell_side(yes_token, yes_qty),
+            sell_side(no_token, no_qty)
+        )
+
+        # Reset inventory for this market
+        self.inventory[yes_token] = 0
+        self.inventory[no_token] = 0
+
     async def execute_arbitrage(self, market_data: dict, amount: float, yes_price: float, no_price: float, yes_fee: float, no_fee: float):
         """
-        Executes Fill-Or-Kill orders to capture the arbitrage.
-        Includes negRisk boolean as requested in API documentation issue #79.
+        Executes Fill-Or-Kill orders for both YES and NO. 
+        If one fails and the other fills, immediately clean up by selling the fill.
         """
         yes_token = market_data['yes']
         no_token = market_data['no']
         tick_size = market_data['tick_size']
 
-        # Round price and amount to tick size and min size to prevent "invalid signature" 
-        # and "invalid tick size" errors. Polymarket requires exact multiples.
-        # Most BTC 5m markets have tick_size 0.01 or 0.001.
         import math
         price_decimals = max(0, int(-math.log10(tick_size)))
-        
-        # Round prices 
         yes_price_rounded = round(yes_price, price_decimals)
         no_price_rounded = round(no_price, price_decimals)
-        
-        # Size must be rounded to 1 decimal place (0.1 increment) for most CLOB markets
-        # or follow the min size. For BTC 5m, 0.1 or 1.0 is standard.
-        # We'll round to 2 decimals to be safe but usually 0.1 is the limit.
         amount_rounded = round(amount, 2)
 
-        logger.info(f"Executing Arbitrage FOK Orders. Buying {amount_rounded} shares of YES @ {yes_price_rounded} & {amount_rounded} shares of NO @ {no_price_rounded}")
+        logger.info(f"Executing Arbitrage FOK Orders: Buying {amount_rounded} pairs.")
 
-        # Construct raw payload YES
-        yes_order_args = OrderArgs(
-            price=yes_price_rounded,
-            size=amount_rounded,
-            side=BUY,
-            token_id=yes_token,
-        )
-
-        no_order_args = OrderArgs(
-            price=no_price_rounded,
-            size=amount_rounded,
-            side=BUY,
-            token_id=no_token,
-        )
+        # Construct raw payload
+        yes_order_args = OrderArgs(price=yes_price_rounded, size=amount_rounded, side=BUY, token_id=yes_token)
+        no_order_args = OrderArgs(price=no_price_rounded, size=amount_rounded, side=BUY, token_id=no_token)
 
         try:
-            # We must use FOK to prevent legged trades
-            # Pass negRisk parameter for negative risk markets to prevent signature invalidation
-            # The client abstract creation, signing, and posting
             from py_clob_client.clob_types import CreateOrderOptions
+            options = CreateOrderOptions(tick_size=str(tick_size), neg_risk=market_data.get('negRisk', False))
             
-            options = CreateOrderOptions(
-                tick_size=str(tick_size),
-                neg_risk=market_data.get('negRisk', False)
-            )
+            # Explicitly use FOK (Fill-Or-Kill) to minimize market risk
+            yes_order_args.type = OrderType.FOK
+            no_order_args.type = OrderType.FOK
 
             if self.dry_run:
-                logger.info(f"[PAPER TRADE] Theoretical YES Fill @ {yes_price} (Vol: {amount})")
-                logger.info(f"[PAPER TRADE] Theoretical NO Fill  @ {no_price} (Vol: {amount})")
-                
-                total_cost = (yes_price + no_price) * amount + yes_fee + no_fee
-                expected_value = amount * 1.0
-                profit = expected_value - total_cost
-                logger.info(f"[PAPER TRADE] Gross Spread Cost: {total_cost:.4f}. Theoretical PnL: {profit:.4f}")
+                logger.info(f"[PAPER TRADE] Arbitrage Found (Vol: {amount})")
                 
                 # Write to JSON for analysis
                 trade_record = {
@@ -190,8 +198,8 @@ class ArbitrageStrategy:
                     "no_price": no_price,
                     "yes_fee": yes_fee,
                     "no_fee": no_fee,
-                    "total_cost": total_cost,
-                    "theoretical_profit": profit
+                    "total_cost": (yes_price + no_price) * amount + yes_fee + no_fee,
+                    "theoretical_profit": amount - ((yes_price + no_price) * amount + yes_fee + no_fee)
                 }
                 
                 try:
@@ -208,17 +216,68 @@ class ArbitrageStrategy:
             resp_yes = self.client.create_and_post_order(yes_order_args, options)
             resp_no = self.client.create_and_post_order(no_order_args, options)
 
-            logger.info(f"YES Order POST: {resp_yes}")
-            logger.info(f"NO Order POST: {resp_no}")
+            logger.info(f"YES Order Status: {resp_yes.get('status')} | NO Order Status: {resp_no.get('status')}")
             
-            # Post-arbitrage, if successful we should convert Negative Risk back to USDC if applicable.
-            if market_data.get('negRisk') and not self.dry_run:
-                # USDC has 6 decimals on Polygon. Merging the tokens returns 1 USDC per pair.
-                logger.info(f"Merging Negative Risk tokens to recover capital for condition {market_data['condition_id']}")
+            yes_matched = resp_yes.get('success') and resp_yes.get('status') == 'matched'
+            no_matched = resp_no.get('success') and resp_no.get('status') == 'matched'
+
+            # --- Legging Safety Logic ---
+            if yes_matched != no_matched:
+                logger.error(f"Legging Risk Detected! YES Matched: {yes_matched}, NO Matched: {no_matched}")
+                
+                # 1. Cancel hanging orders immediately
+                if resp_yes.get('orderID'):
+                    try: self.client.cancel_order(resp_yes['orderID'])
+                    except: pass
+                if resp_no.get('orderID'):
+                    try: self.client.cancel_order(resp_no['orderID'])
+                    except: pass
+                
+                # 2. Emergency Liquidation of the side that DID fill
+                if not self.dry_run:
+                    # Extract ACTUAL filled amount to avoid "insufficient balance" during cleanup
+                    try:
+                        matched_resp = resp_yes if yes_matched else resp_no
+                        matched_token = yes_token if yes_matched else no_token
+                        actual_qty = float(matched_resp.get('takingAmount') or 0)
+                        
+                        if actual_qty > 0:
+                            logger.warning(f"Emergency Cleanup: Market-selling {actual_qty:.6f} orphan tokens.")
+                            await self.active_exit(market_data, forced_token=matched_token, forced_qty=actual_qty)
+                        else:
+                            logger.error("Legging detected but caught-side reporting zero fill. Manual check required.")
+                    except Exception as ex:
+                        logger.error(f"Failed to execute emergency liquidation: {ex}")
+                return
+
+            if not yes_matched and not no_matched:
+                logger.info("Arbitrage failed to fill at requested prices (FOK triggered). Skipping.")
+                return
+
+            # Both matched! Merge tokens to recover USDC capital.
+            if not self.dry_run:
+                # Give Polygon indexing a moment before querying balances for the merge
+                await asyncio.sleep(2)
                 try:
-                    self.blockchain.convert_negative_risk(market_data['condition_id'], int(amount_rounded * 10**6))
+                    # Query actual on-chain balances in the Funder wallet for precision merge
+                    logger.info("Querying on-chain balances for precision merge...")
+                    bal_yes = self.blockchain.get_token_balance(self.blockchain.funder, yes_token)
+                    bal_no = self.blockchain.get_token_balance(self.blockchain.funder, no_token)
+                    
+                    merge_qty_uint = min(bal_yes, bal_no)
+                    
+                    if merge_qty_uint > 0:
+                        logger.info(f"Merging {merge_qty_uint / 10**6:.6f} pairs (On-Chain Balance) back to USDC...")
+                        self.blockchain.merge_positions(market_data['condition_id'], merge_qty_uint)
+                    else:
+                        logger.warning(f"Merge skipped: On-chain balances too low (YES: {bal_yes}, NO: {bal_no})")
                 except Exception as ex:
-                    logger.error(f"Failed to convert Negative Risk tokens: {ex}")
+                    logger.error(f"Failed to fetch on-chain balances or merge: {ex}")
+                    
+            # Track our position for the regular exit logic (mostly useful for 30s-pre-close safety)
+            # We track the target_amount to ensure we sell everything we intended to hedge
+            self.inventory[market_data['yes']] = self.inventory.get(market_data['yes'], 0) + amount_rounded
+            self.inventory[market_data['no']] = self.inventory.get(market_data['no'], 0) + amount_rounded
 
         except Exception as e:
             logger.error(f"Execution failed: {e}")
@@ -227,7 +286,6 @@ class ArbitrageStrategy:
         """
         Callback from the WebSocket stream.
         """
-        # Note: we use asyncio.gather for parallel evaluation
         tasks = []
         for market in self.markets:
             tasks.append(self.evaluate_market(market, current_prices, print_summary=bot_config.PRINT_VERBOSE_SPREADS))
@@ -236,7 +294,6 @@ class ArbitrageStrategy:
     async def run_background_reporting(self, streamer):
         """
         Prints the current known spreads exactly every 10 seconds.
-        Decoupled from websocket updates so it prints even when the market is illiquid.
         """
         while True:
             await asyncio.sleep(10)
@@ -245,7 +302,6 @@ class ArbitrageStrategy:
             for market in self.markets:
                 yes_token = market['yes']
                 no_token = market['no']
-                # Grab latest known prices from the streamer object
                 yes_data = streamer.best_prices.get(yes_token, {})
                 no_data = streamer.best_prices.get(no_token, {})
                 yes_ask = yes_data.get("ask", 0)
@@ -254,6 +310,5 @@ class ArbitrageStrategy:
                 if yes_ask > 0 or no_ask > 0:
                     logger.info(f"Market {market['market_id'][-6:]}: YES ask @ ${yes_ask:.2f} | NO ask @ ${no_ask:.2f}")
                 
-            # Attempt an evaluation pass simply to trigger the detailed `No Arb` reason prints
             for market in self.markets:
                 await self.evaluate_market(market, streamer.best_prices, print_summary=bot_config.PRINT_VERBOSE_SPREADS)
