@@ -1,0 +1,7 @@
+py-clob-client
+web3
+redis
+python-dotenv
+websockets
+requests
+pytest
