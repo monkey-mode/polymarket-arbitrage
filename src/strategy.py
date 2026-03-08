@@ -69,15 +69,10 @@ class ArbitrageStrategy:
         if yes_ask == 0 or no_ask == 0:
             return # No liquidity
 
-        # Determine starting synthetic volume (USDC pairs)
-        # We target 3.0 payout, but must satisfy $1.00 min order value per leg.
-        # We use $1.05 as a safety floor.
-        target_amount = max(3.0, 1.05 / yes_ask, 1.05 / no_ask)
-        
-        # Cap at available liquidity
-        target_amount = min(target_amount, min(yes_ask_sz, no_ask_sz))
-        
-        if target_amount < 1: # Absolute minimum
+        # Determine the maximum synthetic volume we can cross
+        # Target size set to 1.0 (1 USD payout equivalent)
+        target_amount = min(1.0, min(yes_ask_sz, no_ask_sz))
+        if target_amount < 1:
             return
 
         # Calculate exact cost + dynamic fees
@@ -96,7 +91,7 @@ class ArbitrageStrategy:
         # Does target < 1.00 ratio hold true?
         if total_cost < expected_payout:
             profit = expected_payout - total_cost
-            logger.info(f"Arbitrage Found! Target Amount: {target_amount}, Cost: ${total_cost:.4f}, Profit: ${profit:.4f}")
+            logger.info(f"Arbitrage Found! Target Shares: {target_amount:.2f}, Cost: ${total_cost:.4f}, Profit: ${profit:.4f}")
             
             if self.redis_logger:
                 log_data = {
@@ -147,7 +142,7 @@ class ArbitrageStrategy:
         # We'll round to 2 decimals to be safe but usually 0.1 is the limit.
         amount_rounded = round(amount, 2)
 
-        logger.info(f"Executing Arbitrage FOK Orders. YES at {yes_price_rounded}, NO at {no_price_rounded} (Rounded)")
+        logger.info(f"Executing Arbitrage FOK Orders. Buying {amount_rounded} shares of YES @ {yes_price_rounded} & {amount_rounded} shares of NO @ {no_price_rounded}")
 
         # Construct raw payload YES
         yes_order_args = OrderArgs(
