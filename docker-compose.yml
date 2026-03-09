@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   redis:
     image: redis:7.0-alpine
@@ -7,6 +9,32 @@ services:
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
+    restart: always
+
+  # bot:
+  #   build: .
+  #   container_name: polymarket-bot
+  #   depends_on:
+  #     - redis
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - REDIS_HOST=redis
+  #   command: python src/main.py
+  #   restart: always
+
+  subscriber:
+    build: .
+    container_name: polymarket-subscriber
+    depends_on:
+      - redis
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+    volumes:
+      - ./logs:/app/logs
+    command: python src/subscriber.py
     restart: always
 
 volumes:

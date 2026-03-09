@@ -38,7 +38,6 @@ async def run_market_cycle(market_data: dict, client, blockchain, dry_run: bool,
 
     # 2. Start WebSocket stream in a background task
     stream_task = asyncio.create_task(streamer.connect_and_stream(strategy.on_price_update))
-    logger_task = asyncio.create_task(redis_logger.run_subscriber())
 
     try:
         # 3. Wait until 30 seconds before expiry
@@ -61,9 +60,8 @@ async def run_market_cycle(market_data: dict, client, blockchain, dry_run: bool,
     finally:
         # Cleanup tasks for this cycle
         stream_task.cancel()
-        logger_task.cancel()
         try:
-            await asyncio.gather(stream_task, logger_task, return_exceptions=True)
+            await asyncio.gather(stream_task, return_exceptions=True)
         except:
             pass
     
