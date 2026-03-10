@@ -1,3 +1,4 @@
+import json
 import time
 from datetime import datetime, timezone, timedelta
 import requests
@@ -112,7 +113,6 @@ class DiscoveryManager:
             # Usually it's in `clobTokenIds` for recent API versions
             raw_outcomes = market.get("outcomes", "[]")
             if isinstance(raw_outcomes, str):
-                import json
                 try:
                     outcome_names = json.loads(raw_outcomes)
                 except:
@@ -122,7 +122,6 @@ class DiscoveryManager:
             tokens_raw = market.get("clobTokenIds", "[]")
             if isinstance(tokens_raw, str):
                 try:
-                    import json
                     tokens = json.loads(tokens_raw)
                 except:
                     tokens = []

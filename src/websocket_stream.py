@@ -1,56 +1,58 @@
+"""
+WebSocket Price Streamer
+
+Maintains a low-latency WebSocket connection to the Polymarket CLOB
+and passes best-bid-ask updates to a strategy callback.
+"""
 import asyncio
 import json
 import logging
 import websockets
-from py_clob_client.client import ClobClient
+
+from src.client import PolymarketClient
 
 logger = logging.getLogger(__name__)
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
+
 class WebSocketStreamer:
-    """
-    Manages low-latency WebSocket connection to the Polymarket CLOB.
-    """
-    def __init__(self, client: ClobClient, target_markets: list):
+    """Manages real-time price streaming from the Polymarket CLOB."""
+
+    def __init__(self, client: PolymarketClient, target_markets: list):
         self.client = client
-        self.target_markets = target_markets  # List of dicts with 'yes' and 'no' token ids
-        
-        self.best_prices = {} # Map token_id -> {"bid": price, "ask": price, "bid_sz": size, "ask_sz": size}
-    
-    def get_token_ids(self) -> list:
+        self.target_markets = target_markets
+        self.best_prices: dict = {}
+
+    def get_token_ids(self) -> list[str]:
         ids = []
         for m in self.target_markets:
-            ids.extend([m['yes'], m['no']])
+            ids.extend([m["yes"], m["no"]])
         return ids
 
-    async def connect_and_stream(self, strategy_callback):
+    async def connect_and_stream(self, strategy_callback) -> None:
         """
-        Connects to WS, subscribes to best_bid_ask, and passes updates to the strategy_callback.
-        Includes a reconnection loop for resilience.
+        Connects, subscribes, and passes best_bid_ask updates to the callback.
+        Reconnects automatically on failure.
         """
         while True:
             try:
-                async with websockets.connect(WS_URL) as websocket:
-                    logger.info("WebSocket connected. Sending subscription payload...")
-                    
-                    # Manage heartbeat task
-                    heartbeat_task = asyncio.create_task(self.heartbeat_loop())
-                    
+                async with websockets.connect(WS_URL) as ws:
+                    logger.info("WebSocket connected. Subscribing...")
+                    heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
                     try:
-                        # Subscribe to best_bid_ask for instant Yes/No sum arbitrage
-                        sub_payload = {
+                        await ws.send(json.dumps({
                             "assets_ids": self.get_token_ids(),
                             "type": "market",
-                            "custom_feature_enabled": True 
-                        }
-                        await websocket.send(json.dumps(sub_payload))
-                        
-                        async for message in websocket:
+                            "custom_feature_enabled": True,
+                        }))
+
+                        async for message in ws:
                             payload = json.loads(message)
                             if isinstance(payload, dict):
                                 payload = [payload]
-                                
+
                             for data in payload:
                                 if data.get("event_type") == "best_bid_ask":
                                     token_id = data.get("asset_id")
@@ -68,21 +70,17 @@ class WebSocketStreamer:
                             await heartbeat_task
                         except (asyncio.CancelledError, Exception):
                             pass
+
             except Exception as e:
-                logger.error(f"WebSocket connection lost: {e}. Reconnecting in 5s...")
+                logger.error(f"WebSocket lost: {e}. Reconnecting in 5s...")
                 await asyncio.sleep(5)
 
-    async def heartbeat_loop(self):
-        """
-        Performs periodic POST /heartbeats using py-clob-client authentication.
-        REST calls block locally, but we wrap them.
-        """
+    async def _heartbeat_loop(self) -> None:
+        """Sends periodic keep-alive pings via the CLOB client."""
         while True:
-            await asyncio.sleep(15) # Send every 15 seconds
+            await asyncio.sleep(15)
             try:
-                # py-clob-client handles HTTP headers including the HMAC HMAC-SHA256 signature
-                # get_ok() is a wrapper. In real production, use auth header manually if SDK lacks heartbeat mapping.
-                self.client.get_ok() 
-                logger.debug("Successfully sent authenticated heartbeat.")
+                self.client.heartbeat()
+                logger.debug("Heartbeat sent.")
             except Exception as e:
                 logger.error(f"Heartbeat failed: {e}")

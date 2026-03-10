@@ -159,26 +159,18 @@ class BlockchainManager:
             logger.error(f"Failed to fetch balance for {token_id}: {e}")
             return 0
 
-    def merge_positions(self, condition_id_hex, amount):
-        """
-        Merges YES and NO tokens back into USDC.
-        `amount` is the number of pairs to merge (uint256, 6 decimals).
-        """
-        if self.signer_address != self.funder:
-            logger.warning(f"CRITICAL: Signer ({self.signer_address}) is not Funder ({self.funder}). Merge will likely fail unless funds are moved or Funder signs.")
-            
-        condition_id_bytes = Web3.to_bytes(hexstr=condition_id_hex)
-        collateral_token = Web3.to_checksum_address(config.Contracts.USDC)
-        parent_id = b'\x00' * 32 # standard binary markets have no parent
-        
-        # Partition 1 and 2 usually represent YES and NO outcomes
-        partition = [1, 2] 
-        
-        logger.info(f"Merging {amount / 10**6:.6f} pairs back to USDC for condition {condition_id_hex}")
-        return self.send_tx(self.ctf_contract.functions.mergePositions(
-            collateral_token,
-            parent_id,
-            condition_id_bytes,
-            partition,
-            amount
-        ))
+    def get_usdc_balance(self, address: str = None) -> float:
+        """Returns the USDC.e balance of the given address (or funder) in dollars."""
+        target = Web3.to_checksum_address(address or self.funder)
+        try:
+            usdc = self.w3.eth.contract(
+                address=Web3.to_checksum_address(config.Contracts.USDC),
+                abi=[{"constant": True, "inputs": [{"name": "account", "type": "address"}],
+                      "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
+                      "type": "function"}],
+            )
+            return usdc.functions.balanceOf(target).call() / 10**6
+        except Exception as e:
+            logger.error(f"Failed to fetch USDC balance: {e}")
+            return 0.0
+
