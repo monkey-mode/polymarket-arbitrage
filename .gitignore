@@ -44,3 +44,5 @@ logs/
 Thumbs.db
 Desktop.ini
 .pytest_cache
+
+.claude/

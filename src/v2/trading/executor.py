@@ -8,7 +8,7 @@ import math
 import asyncio
 import logging
 
-from py_clob_client.clob_types import OrderArgs, OrderType, CreateOrderOptions
+from py_clob_client.clob_types import MarketOrderArgs, OrderType, CreateOrderOptions
 from py_clob_client.order_builder.constants import BUY
 
 from src.v2.exchange.client import PolymarketClient
@@ -45,49 +45,54 @@ class OrderExecutor:
         price_decimals = max(0, int(-math.log10(tick_size)))
         yes_price_rounded = round(yes_price, price_decimals)
         no_price_rounded = round(no_price, price_decimals)
-        amount_rounded = round(amount, 2)
+        amount_rounded = round(amount, 2) 
 
         try:
-            yes_order_args = OrderArgs(
+            yes_order_args = MarketOrderArgs(
                 price=yes_price_rounded,
-                size=amount_rounded,
+                amount=amount_rounded,
                 side=BUY,
                 token_id=yes_token,
             )
-            no_order_args = OrderArgs(
+
+            no_order_args = MarketOrderArgs(
                 price=no_price_rounded,
-                size=amount_rounded,
+                amount=amount_rounded,
                 side=BUY,
                 token_id=no_token,
             )
 
             options = CreateOrderOptions(
-                tick_size=str(tick_size),
+                tick_size="0.01",
                 neg_risk=market_data.get("negRisk", False),
             )
 
-            yes_order_args.type = OrderType.FOK
-            no_order_args.type = OrderType.FOK
-
-            resp_yes = self.client.place_limit_order(yes_order_args, options)
-            resp_no = self.client.place_limit_order(no_order_args, options)
+            # Pass FOK as the order_type argument — sets it correctly in the API call
+            logger.info(f"YES Order Args: {yes_order_args}")
+            resp_yes = self.client.place_limit_order(yes_order_args, options, OrderType.FOK)
+            logger.info(f"NO Order Args: {no_order_args}")
+            resp_no = self.client.place_limit_order(no_order_args, options, OrderType.FOK)
 
             logger.info(f"YES Order: {resp_yes}")
             logger.info(f"NO Order: {resp_no}")
             logger.info(f"YES Status: {resp_yes.get('status')} | NO Status: {resp_no.get('status')}")
 
-            # Brief wait if status is 'live' — exchange may still be processing the match
-            if resp_yes.get("status") == "live" or resp_no.get("status") == "live":
-                await asyncio.sleep(0.3)
+            # "live" means the order leaked onto the book (was NOT treated as FOK).
+            # Cancel any such orders immediately before evaluating match status.
+            if resp_yes.get("status") == "live":
+                logger.warning("YES order resting on book (expected FOK) — cancelling.")
+                self._cancel_if_exists(resp_yes)
+            if resp_no.get("status") == "live":
+                logger.warning("NO order resting on book (expected FOK) — cancelling.")
+                self._cancel_if_exists(resp_no)
 
-            yes_matched = resp_yes.get("success") and resp_yes.get("status") in ["matched", "live"]
-            no_matched = resp_no.get("success") and resp_no.get("status") in ["matched", "live"]
+            # Only "matched" counts as a successful FOK fill
+            yes_matched = resp_yes.get("success") and resp_yes.get("status") == "matched"
+            no_matched = resp_no.get("success") and resp_no.get("status") == "matched"
 
             # --- Legging Safety ---
             if yes_matched != no_matched:
                 logger.error(f"Legging Risk! YES: {yes_matched}, NO: {no_matched}")
-                self._cancel_if_exists(resp_yes)
-                self._cancel_if_exists(resp_no)
 
                 if not self.dry_run:
                     matched_resp = resp_yes if yes_matched else resp_no
@@ -95,7 +100,7 @@ class OrderExecutor:
                     actual_qty = float(matched_resp.get("takingAmount") or 0)
 
                     if actual_qty > 0:
-                        logger.warning(f"Emergency Cleanup: selling {actual_qty:.6f} orphan tokens.")
+                        logger.warning(f"Emergency Cleanup: selling {actual_qty:.3f} orphan tokens.")
                         await self.liquidate_token(matched_token, actual_qty)
                     else:
                         logger.error("Legging detected but zero fill. Manual check required.")
@@ -119,7 +124,7 @@ class OrderExecutor:
         """Market-sells a specific token. Used for emergency cleanup and planned exits."""
         if qty <= 0:
             return
-        logger.info(f"Liquidating {qty:.2f} shares of {token_id[-8:]}...")
+        logger.info(f"Liquidating {qty:.3f} shares of {token_id[-8:]}...")
         try:
             resp = self.client.create_market_sell(token_id, qty)
             logger.info(f"EXIT order for {token_id[-8:]}: {resp.get('status', 'Unknown')}")
@@ -138,7 +143,7 @@ class OrderExecutor:
             return
 
         logger.info(f"Liquidating positions for {market_data['market_id'][-6:]}: "
-                     f"{yes_qty:.2f} YES, {no_qty:.2f} NO")
+                     f"{yes_qty:.3f} YES, {no_qty:.3f} NO")
 
         await asyncio.gather(
             self.liquidate_token(yes_token, yes_qty),

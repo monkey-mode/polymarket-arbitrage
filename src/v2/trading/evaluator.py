@@ -85,7 +85,7 @@ class MarketEvaluator:
 
         logger.debug(
             f"Market {market_id}: No arb — "
-            f"Y:{yes_ask:.2f} + N:{no_ask:.2f} = {ask_sum:.4f} "
-            f"(cost ${total_cost:.4f} vs payout ${expected_payout:.4f})"
+            f"Y:{yes_ask:.3f} + N:{no_ask:.3f} = {ask_sum:.3f} "
+            f"(cost ${total_cost:.3f} vs payout ${expected_payout:.3f})"
         )
         return None
