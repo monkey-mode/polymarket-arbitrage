@@ -20,7 +20,7 @@ services:
   #     - .env
   #   environment:
   #     - REDIS_HOST=redis
-  #   command: python src/main.py
+  #   command: python src/v2/main.py
   #   restart: always
 
   subscriber:
@@ -34,7 +34,7 @@ services:
       - REDIS_HOST=redis
     volumes:
       - ./logs:/app/logs
-    command: python src/subscriber.py
+    command: python src/v2/subscriber.py
     restart: always
 
 volumes:
