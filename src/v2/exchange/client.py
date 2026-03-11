@@ -6,7 +6,7 @@ Other modules should NEVER import or call ClobClient directly — use this inste
 """
 import logging
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, CreateOrderOptions
+from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs, CreateOrderOptions, PostOrdersArgs
 from py_clob_client.order_builder.constants import BUY, SELL
 
 
@@ -44,24 +44,21 @@ class PolymarketClient:
     #  Order Placement
     # ------------------------------------------------------------------ #
 
-    def place_limit_order(self, order_args: OrderArgs, options: CreateOrderOptions, order_type: OrderType = OrderType.GTC) -> dict:
-        """Sign then post a limit order — two-step to support explicit order_type (FOK/GTC/GTD)."""
-        signed = self._client.create_market_order(order_args, options)
-        return self._client.post_order(signed, order_type)
+    def sign_market_order(self, order_args: MarketOrderArgs, options: CreateOrderOptions):
+        """Sign a market order without posting it — use with place_batch_fok."""
+        return self._client.create_market_order(order_args, options)
+    
+    def sign_order(self, order_args: OrderArgs, options: CreateOrderOptions):
+        return self._client.create_order(order_args, options)
 
-    def place_fok_buy(self, token_id: str, usdc_amount: float, worst_price: float) -> dict:
-        """
-        FOK BUY via MarketOrderArgs — spend exactly usdc_amount USDC or cancel entirely.
-        worst_price acts as a slippage cap; order cancels if the market has moved past it.
-        Uses create_market_order so maker/taker amounts conform to the 2-decimal API limit.
-        """
-        args = MarketOrderArgs(token_id=token_id, side=BUY, amount=round(usdc_amount, 2), price=worst_price)
-        signed = self._client.create_market_order(args)
-        return self._client.post_order(signed, OrderType.FOK)
+    def place_batch_fok(self, signed_orders: list) -> list[dict]:
+        """Post multiple pre-signed orders as FOK in a single request."""
+        args = [PostOrdersArgs(order=o, orderType=OrderType.FOK) for o in signed_orders]
+        return self._client.post_orders(args)
 
     def create_market_sell(self, token_id: str, amount: float) -> dict:
         """Create a market sell order and post it as GTC for immediate fill."""
-        sell_args = MarketOrderArgs(amount=round(amount, 2), side=SELL, token_id=token_id)
+        sell_args = MarketOrderArgs(amount=amount, side=SELL, token_id=token_id)
         signed = self._client.create_market_order(sell_args)
         return self._client.post_order(signed, OrderType.GTC)
 

@@ -8,7 +8,7 @@ import math
 import asyncio
 import logging
 
-from py_clob_client.clob_types import MarketOrderArgs, OrderType, CreateOrderOptions
+from py_clob_client.clob_types import MarketOrderArgs,OrderArgs, CreateOrderOptions
 from py_clob_client.order_builder.constants import BUY
 
 from src.v2.exchange.client import PolymarketClient
@@ -45,33 +45,61 @@ class OrderExecutor:
         price_decimals = max(0, int(-math.log10(tick_size)))
         yes_price_rounded = round(yes_price, price_decimals)
         no_price_rounded = round(no_price, price_decimals)
-        amount_rounded = round(amount, 2) 
+        shares = round(amount, 2)
+
+        # Both USDC amounts must be >= $1 (API minimum).
+        # The cheapest leg is the binding constraint — find the minimum shares
+        # so that min_price × shares >= 1.0, then use that for both sides.
+        min_price = min(yes_price_rounded, no_price_rounded)
+        min_shares = math.ceil(100.0 / min_price) / 100  # ceil to 2 decimal places
+        if shares < min_shares:
+            logger.debug(f"Bumping shares {shares} → {min_shares} to meet $1 order minimum (cheapest leg: ${min_price})")
+            shares = min_shares
+
+        # MarketOrderArgs.amount (BUY) = USDC to spend, not shares
+        yes_usdc = round(yes_price_rounded * shares, 2)
+        no_usdc = round(no_price_rounded * shares, 2)
 
         try:
             yes_order_args = MarketOrderArgs(
                 price=yes_price_rounded,
-                amount=amount_rounded,
+                amount=yes_usdc,
                 side=BUY,
                 token_id=yes_token,
             )
 
             no_order_args = MarketOrderArgs(
                 price=no_price_rounded,
-                amount=amount_rounded,
+                amount=no_usdc,
                 side=BUY,
                 token_id=no_token,
             )
+
+            # yes_order_args = OrderArgs(
+            #     price=yes_price_rounded,
+            #     size=shares,
+            #     side=BUY,
+            #     token_id=yes_token,
+            # )
+
+            # no_order_args = OrderArgs(
+            #     price=no_price_rounded,
+            #     size=shares,
+            #     side=BUY,
+            #     token_id=no_token,
+            # )
 
             options = CreateOrderOptions(
                 tick_size="0.01",
                 neg_risk=market_data.get("negRisk", False),
             )
 
-            # Pass FOK as the order_type argument — sets it correctly in the API call
-            logger.info(f"YES Order Args: {yes_order_args}")
-            resp_yes = self.client.place_limit_order(yes_order_args, options, OrderType.FOK)
-            logger.info(f"NO Order Args: {no_order_args}")
-            resp_no = self.client.place_limit_order(no_order_args, options, OrderType.FOK)
+            signed_yes = self.client.sign_market_order(yes_order_args, options)
+            signed_no = self.client.sign_market_order(no_order_args, options)
+
+            # signed_yes = self.client.sign_order(yes_order_args, options)
+            # signed_no = self.client.sign_order(no_order_args, options)
+            resp_yes, resp_no = self.client.place_batch_fok([signed_yes, signed_no])
 
             logger.info(f"YES Order: {resp_yes}")
             logger.info(f"NO Order: {resp_no}")
@@ -113,7 +141,7 @@ class OrderExecutor:
             return {
                 "yes_matched": True,
                 "no_matched": True,
-                "amount_rounded": amount_rounded,
+                "amount_rounded": shares,
             }
 
         except Exception as e:

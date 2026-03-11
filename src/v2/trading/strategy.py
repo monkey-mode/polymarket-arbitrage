@@ -121,6 +121,9 @@ class ArbitrageStrategy:
         )
 
         if execution is None:
+            if self.one_shot:
+                logger.info("One-shot mode: trade failed. Stopping for manual inspection.")
+                raise SystemExit(0)
             return  # Failed or legged — already handled by executor
 
         # Track inventory for planned exit
